@@ -3,12 +3,18 @@ services:
     name: robo-venda-coberta
     env: docker
     plan: free
+    dockerfilePath: Dockerfile
     repo: https://github.com/emilymmm21/robo-venda-coberta
     branch: main
     healthCheckPath: /health
     envVars:
       - key: PORT
         value: 10000
-      - key: SCRAPER_PROVIDER
-        value: playwright
-
+      - key: USE_OPLAB
+        value: "1"                 # ligue OPLab
+      - key: OPLAB_BASE_URL
+        value: ""                  # ex: https://api.oplab.com.br
+      - key: OPLAB_CHAIN_PATH
+        value: ""                  # ex: /v1/options/chain
+      - key: OPLAB_API_KEY
+        value: ""                  # adicione o token
