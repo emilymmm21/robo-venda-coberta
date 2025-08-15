@@ -2,7 +2,14 @@ services:
   - type: web
     name: robo-venda-coberta
     env: docker
-    dockerfilePath: ./dockerfile
+    plan: free
+    dockerfilePath: Dockerfile
+    repo: https://github.com/emilymmm21/robo-venda-coberta
+    branch: main
+    healthCheckPath: /docs
+    envVars:
+      - key: PORT
+        value: 10000
 
 
 
