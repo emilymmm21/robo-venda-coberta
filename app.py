@@ -1,19 +1,36 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import requests
 import pandas as pd
 from datetime import datetime
-from bs4 import BeautifulSoup
 
-app = FastAPI()
+# Uma única instância de FastAPI, docs explicitamente habilitados
+app = FastAPI(
+    title="robo-venda-coberta",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
 
+# --- rotas utilitárias ---
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "message": "Robo Venda Coberta API"}
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return JSONResponse({"status": "ok"})
+
+# --- modelos e endpoint principal ---
 class SuggestIn(BaseModel):
     ticker_subjacente: str
     preco_medio: float
     quantidade_acoes: int
-    vencimento: str
-    criterio: str = ">=PM"
-    min_liquidez: int = 10
+    vencimento: str           # "YYYY-MM-DD"
+    criterio: str = ">=PM"    # ou "PM"
+    min_liquidez: int = 10    # mínimo de negócios
 
 @app.post("/covered-call/suggest")
 def suggest(data: SuggestIn):
@@ -24,24 +41,24 @@ def suggest(data: SuggestIn):
     criterio = data.criterio.upper()
     min_liq = data.min_liquidez
 
-    # Coleta a página do Opcoes.net
+    # Coleta página do Opcoes.net
     url = f"https://opcoes.net.br/opcoes/bovespa/{ticker}"
     r = requests.get(url, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail="Falha ao acessar Opcoes.net")
 
+    # Lê tabelas (usa lxml instalado)
     dfs = pd.read_html(r.text, decimal=",", thousands=".")
     if not dfs:
         raise HTTPException(status_code=404, detail="Nenhuma tabela encontrada")
 
-    # Tenta achar a tabela certa
+    # Tenta identificar a cadeia de opções
     chain = None
     for df in dfs:
-        cols = [c.lower() for c in df.columns.astype(str)]
+        cols = [str(c).lower() for c in df.columns.astype(str)]
         if "strike" in str(cols) and ("últ" in str(cols) or "premio" in str(cols)):
             chain = df
             break
-
     if chain is None:
         raise HTTPException(status_code=404, detail="Grade de opções não localizada")
 
@@ -56,7 +73,7 @@ def suggest(data: SuggestIn):
         elif "código" in cl or "ticker" in cl: rename_map[c] = "ticker_opcao"
     chain = chain.rename(columns=rename_map)
 
-    # Trata os dados
+    # Trata tipos e liquidez
     for col in ["strike", "premio"]:
         chain[col] = pd.to_numeric(chain[col], errors="coerce")
     chain["negocios"] = pd.to_numeric(chain.get("negocios", 0), errors="coerce").fillna(0).astype(int)
@@ -65,16 +82,15 @@ def suggest(data: SuggestIn):
     if chain.empty:
         raise HTTPException(status_code=404, detail="Sem liquidez suficiente")
 
-    # Calcula retorno
+    # Datas e retornos
     hoje = datetime.now()
     venc = datetime.strptime(venc_str, "%Y-%m-%d")
-    dias = (venc - hoje).days
-    dias = max(dias, 1)
+    dias = max((venc - hoje).days, 1)
 
     chain["retorno_premio_pct"] = chain["premio"] / pm * 100.0
     chain["retorno_anualizado_pct"] = chain["retorno_premio_pct"] * (252 / dias)
 
-    # Filtra strike
+    # Critério de strike
     if criterio == ">=PM":
         chain = chain[chain["strike"] >= pm]
     elif criterio == "PM":
@@ -120,22 +136,4 @@ def suggest(data: SuggestIn):
         "cenarios": cenarios,
         "fonte_dados": "opcoes.net (scraping ~delay)"
     }
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-
-# se você já tinha "app = FastAPI()", mantenha; isto só garante que exista
-app = FastAPI(title="robo-venda-coberta", version="1.0.0")
-
-# --- rotas utilitárias para evitar 404/healthcheck ---
-@app.get("/", include_in_schema=False)
-def root():
-    return {"ok": True, "message": "Robo Venda Coberta API"}
-
-@app.get("/health", include_in_schema=False)
-def health():
-    return JSONResponse({"status": "ok"})
-
-# ▼▼▼ (suas rotas originais continuam aqui, não removi nada) ▼▼▼
-# from bs4 import BeautifulSoup  # agora disponível
-# ... resto do seu código ...
 
