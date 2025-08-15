@@ -1,321 +1,218 @@
-# main.py
-from __future__ import annotations
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import os, requests, pandas as pd
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-import pandas as pd
-import requests
-import httpx
 from bs4 import BeautifulSoup
 from unidecode import unidecode
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from urllib.parse import urlencode
 
-APP_TITLE = "robo-venda-coberta"
-APP_VERSION = "1.0.0"
+app = FastAPI(title="robo-venda-coberta", version="1.0.0")
 
-# -------- Config por ENV --------
+# ---------- Config ----------
 USE_OPLAB = os.getenv("USE_OPLAB", "0") == "1"
-OPLAB_BASE_URL = os.getenv("OPLAB_BASE_URL", "").rstrip("/")  # ex: https://api.oplab.com.br
-OPLAB_CHAIN_PATH = os.getenv("OPLAB_CHAIN_PATH", "")          # ex: /v1/options/chain
+OPLAB_BASE_URL = os.getenv("OPLAB_BASE_URL", "").rstrip("/")
+OPLAB_CHAIN_PATH = os.getenv("OPLAB_CHAIN_PATH", "")
+OPLAB_QUERY_TEMPLATE = os.getenv("OPLAB_QUERY_TEMPLATE", "ticker={ticker}&vencimento={vencimento}&type=CALL")
 OPLAB_API_KEY = os.getenv("OPLAB_API_KEY", "")
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+OPLAB_AUTH_HEADER = os.getenv("OPLAB_AUTH_HEADER", "Authorization")  # ou "X-API-Key"
 
-# -------- FastAPI --------
-app = FastAPI(
-    title=APP_TITLE,
-    version=APP_VERSION,
-    docs_url="/docs",
-    redoc_url=None,
-)
-
-
-# ------------ MODELOS ------------
+# ---------- Model ----------
 class SuggestIn(BaseModel):
     ticker_subjacente: str
     preco_medio: float
     quantidade_acoes: int
-    vencimento: str           # "YYYY-MM-DD"
-    criterio: str = ">=PM"    # ou "PM"
-    min_liquidez: int = 10    # negociações mínimas
+    vencimento: str
+    criterio: str = ">=PM"
+    min_liquidez: int = 10
 
-
-# ------------ HELPERS ------------
-def _parse_date(s: str) -> Optional[datetime]:
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%fZ"):
-        try:
-            return datetime.strptime(s.split("T")[0], fmt) if "T" in s else datetime.strptime(s, fmt)
-        except Exception:
-            pass
+# ---------- Utils ----------
+def _first_key(d: dict, candidates):
+    for k in candidates:
+        if k in d:
+            return d[k]
+        # também aceita variantes case-insensitive/underscore
+        for dk in d.keys():
+            if dk.replace("_", "").lower() == k.replace("_", "").lower():
+                return d[dk]
     return None
 
+def _extract_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in ["data","results","items","content","options","chain","response"]:
+            v = payload.get(k)
+            if isinstance(v, list):
+                return v
+    # tenta pegar a 1ª lista encontrada
+    if isinstance(payload, dict):
+        for v in payload.values():
+            if isinstance(v, list):
+                return v
+    return []
 
-def _annualize(premio_pct: float, dias: int) -> float:
-    dias = max(dias, 1)
-    return premio_pct * (252 / dias)
-
-
-def _normalize_key(k: Any) -> str:
-    return unidecode(str(k)).strip().lower().replace(" ", "_")
-
-
-def _to_num(x) -> Optional[float]:
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"):
-        return None
-    # tenta formato BR
-    s1 = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s1)
-    except Exception:
-        try:
-            return float(s)
-        except Exception:
-            return None
-
-
-# ------------ PROVIDER: OPLAB ------------
-def fetch_oplab_chain(ticker: str, venc_dt: Optional[datetime]) -> pd.DataFrame:
-    """
-    Cliente genérico pra OpLab.
-    **IMPORTANTE**: como não tenho acesso à doc pública aqui, deixei o cliente
-    configurável via ENV:
-      - OPLAB_BASE_URL      (ex: https://api.oplab.com.br)
-      - OPLAB_CHAIN_PATH    (ex: /v1/options/chain)
-      - OPLAB_API_KEY       (Bearer)
-    O endpoint deve retornar uma lista de contratos de CALL com campos
-    que permitam identificar pelo menos: strike, preço (último/bid/ask),
-    negócios/volume, ticker/símbolo e vencimento.
-    """
+def fetch_oplab_chain(ticker: str, vencimento: str) -> pd.DataFrame:
     if not (OPLAB_BASE_URL and OPLAB_CHAIN_PATH and OPLAB_API_KEY):
-        raise HTTPException(
-            status_code=500,
-            detail="OPLab não configurado: defina OPLAB_BASE_URL, OPLAB_CHAIN_PATH e OPLAB_API_KEY."
-        )
+        raise HTTPException(status_code=500, detail="OpLab não configurado (OPLAB_* faltando)")
 
+    # monta query a partir do template
+    query_str = OPLAB_QUERY_TEMPLATE.format(ticker=ticker, vencimento=vencimento)
     url = f"{OPLAB_BASE_URL}{OPLAB_CHAIN_PATH}"
-    params = {"ticker": ticker.upper(), "type": "CALL"}
-    if venc_dt:
-        # se seu endpoint aceitar, mande a data também:
-        params["maturity"] = venc_dt.strftime("%Y-%m-%d")
+    if "?" in OPLAB_CHAIN_PATH:
+        url = f"{OPLAB_BASE_URL}{OPLAB_CHAIN_PATH}&{query_str}"
+    else:
+        url = f"{OPLAB_BASE_URL}{OPLAB_CHAIN_PATH}?{query_str}"
 
-    headers = {"Authorization": f"Bearer {OPLAB_API_KEY}"}
+    headers = {OPLAB_AUTH_HEADER: f"Bearer {OPLAB_API_KEY}" if OPLAB_AUTH_HEADER.lower()=="authorization" else OPLAB_API_KEY}
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OpLab retornou {r.status_code}")
 
-    try:
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-            resp = client.get(url, params=params, headers=headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"OPLab HTTP {resp.status_code}: {resp.text[:200]}")
-            data = resp.json()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao consultar OPLab: {e}")
-
-    # Tenta ser tolerante com formatos diferentes:
-    # Pode vir {"results":[...]}, {"contracts":[...]}, ou diretamente uma lista
-    items = None
-    if isinstance(data, dict):
-        for key in ("results", "contracts", "data"):
-            if key in data and isinstance(data[key], list):
-                items = data[key]
-                break
-    if items is None and isinstance(data, list):
-        items = data
-
+    payload = r.json()
+    items = _extract_items(payload)
     if not items:
-        raise HTTPException(status_code=404, detail="OPLab: nenhum contrato retornado")
+        raise HTTPException(status_code=404, detail="OpLab: lista vazia")
 
-    rows: List[Dict[str, Any]] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        # normaliza chaves
-        norm = { _normalize_key(k): v for k, v in it.items() }
+    # normaliza em DataFrame
+    df = pd.DataFrame(items)
 
-        # tenta mapear campos mais comuns
-        strike = _to_num(norm.get("strike") or norm.get("preco_exercicio"))
-        # preço do prêmio: tentar "last", "lastprice", "ultimo", "premium", "bid"/"ask" média
-        premio = _to_num(norm.get("last") or norm.get("lastprice") or norm.get("ultimo") or norm.get("premium"))
-        if premio is None:
-            bid = _to_num(norm.get("bid"))
-            ask = _to_num(norm.get("ask"))
-            if bid and ask:
-                premio = (bid + ask) / 2.0
-            elif bid:
-                premio = bid
-            elif ask:
-                premio = ask
+    # mapeia campos comuns (várias alternativas)
+    def pick_col(cands, default=None):
+        for c in df.columns:
+            norm = c.replace("_","").lower()
+            for cand in cands:
+                if norm == cand.replace("_","").lower():
+                    return c
+        return default
 
-        negocios = None
-        for k in ("trades", "tradecount", "negocios", "business_quantity", "volume"):
-            v = _to_num(norm.get(k))
-            if v is not None:
-                negocios = int(v)
-                break
+    col_symbol = pick_col(["symbol","ticker","code","option_symbol","optionsymbol"])
+    col_strike = pick_col(["strike","strikeprice","exercise","exerciseprice"])
+    col_last   = pick_col(["last","lastprice","price","optionprice","close"])
+    col_bid    = pick_col(["bid","bestbid"])
+    col_liq    = pick_col(["trades","numberoftrades","business","negocios","volume","liquidity"])
+    col_exp    = pick_col(["expiration","expirationdate","maturity","duedate"])
 
-        ticker_opcao = (norm.get("symbol") or norm.get("ticker") or norm.get("codigo") or "").upper()
-        venc = norm.get("maturity") or norm.get("vencimento") or norm.get("expirationdate")
-        venc_parsed = _parse_date(venc) if isinstance(venc, str) else None
+    # cria colunas padronizadas
+    out = pd.DataFrame()
+    if col_symbol: out["ticker_opcao"] = df[col_symbol]
+    if col_strike: out["strike"] = pd.to_numeric(df[col_strike], errors="coerce")
+    # prêmio: prioriza last, depois bid
+    premio_series = None
+    if col_last: premio_series = pd.to_numeric(df[col_last], errors="coerce")
+    if (premio_series is None or premio_series.isna().all()) and col_bid:
+        premio_series = pd.to_numeric(df[col_bid], errors="coerce")
+    out["premio"] = premio_series
+    if col_liq:
+        out["negocios"] = pd.to_numeric(df[col_liq], errors="coerce")
+    else:
+        out["negocios"] = 0
+    if col_exp: out["vencimento"] = df[col_exp]
 
-        # filtra só CALL se vier misturado
-        tipo = str(norm.get("type") or norm.get("tipo") or "").upper()
-        if tipo and tipo not in ("C", "CALL", "OPC_CALL"):
-            continue
+    out = out.dropna(subset=["strike","premio"])
+    return out
 
-        if strike is None or premio is None:
-            continue
-
-        rows.append({
-            "ticker_opcao": ticker_opcao,
-            "strike": strike,
-            "premio": premio,
-            "negocios": negocios if negocios is not None else 0,
-            "vencimento": venc_parsed.strftime("%Y-%m-%d") if venc_parsed else None,
-        })
-
-    if not rows:
-        raise HTTPException(status_code=404, detail="OPLab: nenhum contrato CALL utilizável")
-
-    df = pd.DataFrame(rows)
-    return df
-
-
-# ------------ PROVIDER: opcoes.net (scraping) ------------
 def fetch_opcoes_net_chain(ticker: str) -> pd.DataFrame:
     url = f"https://opcoes.net.br/opcoes/bovespa/{ticker}"
-    r = requests.get(url, timeout=HTTP_TIMEOUT)
+    r = requests.get(url, timeout=30)
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"opcoes.net HTTP {r.status_code}")
+        raise HTTPException(status_code=500, detail="Falha ao acessar opcoes.net")
 
-    # 1) tenta HTML tables direto
-    dfs = []
-    try:
-        dfs = pd.read_html(r.text, decimal=",", thousands=".")
-    except Exception:
-        dfs = []
-
-    # 2) se falhar, tenta montar a partir do HTML via BS4
-    if not dfs:
-        soup = BeautifulSoup(r.text, "lxml")
-        tables = soup.find_all("table")
-        for tb in tables:
-            try:
-                df = pd.read_html(str(tb), decimal=",", thousands=".")[0]
-                dfs.append(df)
-            except Exception:
-                pass
-
-    # varre possíveis tabelas de calls
-    chosen = None
+    # tenta encontrar a maior tabela com 'strike' e 'últ/premio'
+    dfs = pd.read_html(r.text, decimal=",", thousands=".")
+    chain = None
+    best_len = 0
     for df in dfs:
-        cols = [_normalize_key(c) for c in df.columns.astype(str)]
-        has_strike = any("strike" in c or "exercicio" in c for c in cols)
-        has_premio = any("ult" in c or "premio" in c or "ultimo" in c for c in cols)
-        if has_strike and has_premio:
-            chosen = df
-            break
+        cols = [unidecode(str(c)).lower() for c in df.columns]
+        if any("strike" in c for c in cols) and any(("ult" in c) or ("premio" in c) for c in cols):
+            if len(df) > best_len:
+                chain, best_len = df, len(df)
 
-    if chosen is None or chosen.empty:
-        raise HTTPException(status_code=404, detail="Grade de opções não localizada")
+    if chain is None:
+        # plano B: usar BS4 pra extrair tabela manualmente
+        soup = BeautifulSoup(r.text, "lxml")
+        table = soup.find("table")
+        if not table:
+            raise HTTPException(status_code=404, detail="Grade de opções não localizada")
+        chain = pd.read_html(str(table), decimal=",", thousands=".")[0]
 
-    rename = {}
-    for c in chosen.columns:
-        cl = _normalize_key(c)
-        if "strike" in cl or "exercicio" in cl:
-            rename[c] = "strike"
-        elif "neg" in cl or "business" in cl or "volume" in cl:
-            rename[c] = "negocios"
-        elif "ult" in cl or "premio" in cl or "ultimo" in cl:
-            rename[c] = "premio"
-        elif "venc" in cl or "maturity" in cl:
-            rename[c] = "vencimento"
-        elif "codigo" in cl or "ticker" in cl or "symbol" in cl:
-            rename[c] = "ticker_opcao"
+    rename_map = {}
+    for c in chain.columns:
+        cl = unidecode(str(c)).strip().lower()
+        if "strike" in cl: rename_map[c] = "strike"
+        elif "neg" in cl: rename_map[c] = "negocios"
+        elif ("ult" in cl) or ("premio" in cl): rename_map[c] = "premio"
+        elif "venc" in cl: rename_map[c] = "vencimento"
+        elif "codigo" in cl or "ticker" in cl or "simbolo" in cl: rename_map[c] = "ticker_opcao"
+    chain = chain.rename(columns=rename_map)
 
-    df = chosen.rename(columns=rename)
-    for col in ("strike", "premio"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "negocios" in df.columns:
-        df["negocios"] = pd.to_numeric(df["negocios"], errors="coerce").fillna(0).astype(int)
+    for col in ["strike","premio"]:
+        chain[col] = pd.to_numeric(chain[col], errors="coerce")
+    if "negocios" in chain.columns:
+        chain["negocios"] = pd.to_numeric(chain["negocios"], errors="coerce").fillna(0)
     else:
-        df["negocios"] = 0
+        chain["negocios"] = 0
+    chain = chain.dropna(subset=["strike","premio"])
+    return chain
 
-    df = df.dropna(subset=["strike", "premio"])
-    if df.empty:
-        raise HTTPException(status_code=404, detail="Sem dados válidos de strike/premio")
-    return df
-
-
-def get_chain(ticker: str, venc_dt: Optional[datetime]) -> pd.DataFrame:
-    if USE_OPLAB:
-        return fetch_oplab_chain(ticker, venc_dt)
-    # fallback
-    return fetch_opcoes_net_chain(ticker)
-
-
-# ------------ ENDPOINTS ------------
-@app.get("/")
+# ---------- Rotas utilitárias ----------
+@app.get("/", include_in_schema=False)
 def root():
     return {"ok": True, "message": "Robo Venda Coberta API"}
 
-@app.get("/health")
+@app.get("/health", include_in_schema=False)
 def health():
-    return {"status": "ok"}
+    return JSONResponse({"status": "ok"})
 
+# ---------- Endpoint principal ----------
 @app.post("/covered-call/suggest")
 def suggest(data: SuggestIn):
-    ticker = data.ticker_subjacente.upper()
+    ticker = data.ticker_subjacente.upper().strip()
     pm = float(data.preco_medio)
     qty = int(data.quantidade_acoes)
-    criterio = (data.criterio or ">=PM").upper().strip()
-    venc_dt = _parse_date(data.vencimento)
+    criterio = data.criterio.upper().strip()
     min_liq = int(data.min_liquidez)
 
-    if venc_dt is None:
-        raise HTTPException(status_code=422, detail="vencimento deve estar no formato YYYY-MM-DD")
-
-    chain = get_chain(ticker, venc_dt)
+    # pega chain
+    if USE_OPLAB:
+        df = fetch_oplab_chain(ticker, data.vencimento)
+    else:
+        df = fetch_opcoes_net_chain(ticker)
 
     # filtra liquidez
-    if "negocios" in chain.columns:
-        chain = chain[chain["negocios"] >= min_liq]
-    if chain.empty:
+    df = df[df["negocios"] >= min_liq]
+    if df.empty:
         raise HTTPException(status_code=404, detail="Sem liquidez suficiente")
 
-    # filtra por vencimento se disponível
-    if "vencimento" in chain.columns:
-        chain["venc_dt"] = chain["vencimento"].apply(lambda s: _parse_date(str(s)) if pd.notna(s) else None)
-        chain = chain[chain["venc_dt"].apply(lambda d: (d == venc_dt) if d else True)]
-    if chain.empty:
-        # se não houver dado de vencimento, segue com a melhor disponível
-        pass
+    # datas
+    dias = None
+    if data.vencimento:
+        try:
+            venc = datetime.strptime(data.vencimento, "%Y-%m-%d")
+            dias = max((venc - datetime.now()).days, 1)
+        except Exception:
+            dias = None
 
-    # cálculo de retornos
-    dias = max((venc_dt - datetime.now()).days, 1)
-    chain["retorno_premio_pct"] = (chain["premio"] / pm) * 100.0
-    chain["retorno_anualizado_pct"] = chain["retorno_premio_pct"].apply(lambda x: _annualize(x, dias))
+    # métricas
+    df["retorno_premio_pct"] = (df["premio"] / pm) * 100.0
+    if dias:
+        df["retorno_anualizado_pct"] = df["retorno_premio_pct"] * (252 / dias)
+    else:
+        df["retorno_anualizado_pct"] = df["retorno_premio_pct"]
 
     # critério de strike
     if criterio == ">=PM":
-        chain = chain[chain["strike"] >= pm]
+        df = df[df["strike"] >= pm]
     elif criterio == "PM":
-        chain["diff_pm"] = (chain["strike"] - pm).abs()
-        chain = chain.sort_values(by="diff_pm")
-    if chain.empty:
+        df["diff"] = (df["strike"] - pm).abs()
+        df = df.sort_values("diff")
+
+    if df.empty:
         raise HTTPException(status_code=404, detail="Nenhum strike compatível com o critério")
 
-    best = chain.sort_values(by="retorno_anualizado_pct", ascending=False).iloc[0]
-
-    strike = float(best["strike"])
-    premio = float(best["premio"])
+    best = df.sort_values(by="retorno_anualizado_pct", ascending=False).iloc[0]
+    strike = float(best["strike"]); premio = float(best["premio"])
     negocios = int(best.get("negocios", 0))
-    venc_out = best.get("vencimento")
     contratos = qty // 100
 
     def resultado(preco_venc: float) -> float:
@@ -328,11 +225,11 @@ def suggest(data: SuggestIn):
             return premio * qty
 
     cenarios = []
-    for p in [pm - 10, pm, strike - 1, strike, strike + 3]:
+    for p in [pm-10, pm, strike-1, strike, strike+3]:
         cenarios.append({
-            "preco_acao_no_vencimento": round(float(p), 2),
-            "resultado_total": round(float(resultado(p)), 2),
-            "observacao": "exercido" if p >= strike else "nao_exercido"
+            "preco_acao_no_vencimento": round(p, 2),
+            "resultado_total": round(resultado(p), 2),
+            "observacao": "exercido" if p >= strike else "nao exercido"
         })
 
     return {
@@ -345,9 +242,8 @@ def suggest(data: SuggestIn):
             "dias_ate_vencimento": dias,
             "retorno_premio_pct": round(float(best["retorno_premio_pct"]), 2),
             "retorno_anualizado_pct": round(float(best["retorno_anualizado_pct"]), 2),
-            "contratos_sugeridos": contratos,
+            "contratos_sugeridos": contratos
         },
         "cenarios": cenarios,
-        "fonte_dados": "OPLab" if USE_OPLAB else "opcoes.net (scraping)",
-        "observacoes": "Para OPLab, configure OPLAB_BASE_URL, OPLAB_CHAIN_PATH e OPLAB_API_KEY.",
+        "fonte_dados": "OpLab" if USE_OPLAB else "opcoes.net"
     }
