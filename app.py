@@ -13,6 +13,7 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+# --- rotas utilitárias ---
 @app.get("/", include_in_schema=False)
 def root():
     return {"ok": True, "message": "Robo Venda Coberta API"}
@@ -21,14 +22,16 @@ def root():
 def health():
     return JSONResponse({"status": "ok"})
 
+# --- contrato de entrada ---
 class SuggestIn(BaseModel):
     ticker_subjacente: str
     preco_medio: float
     quantidade_acoes: int
     vencimento: str
-    criterio: str = ">=PM"
-    min_liquidez: int = 10
+    criterio: str = ">=PM"  # opções: ">=PM" ou "PM"
+    min_liquidez: int = 10  # negócios mínimos
 
+# --- rota principal ---
 @app.post("/covered-call/suggest")
 def suggest(data: SuggestIn):
     ticker = data.ticker_subjacente.upper()
@@ -38,6 +41,7 @@ def suggest(data: SuggestIn):
     criterio = data.criterio.upper()
     min_liq = data.min_liquidez
 
+    # fonte de dados
     url = f"https://opcoes.net.br/opcoes/bovespa/{ticker}"
     r = requests.get(url, timeout=30)
     if r.status_code != 200:
@@ -47,6 +51,7 @@ def suggest(data: SuggestIn):
     if not dfs:
         raise HTTPException(status_code=404, detail="Nenhuma tabela encontrada")
 
+    # escolhe a grade de opções
     chain = None
     for df in dfs:
         cols = [str(c).lower() for c in df.columns.astype(str)]
@@ -56,6 +61,7 @@ def suggest(data: SuggestIn):
     if chain is None:
         raise HTTPException(status_code=404, detail="Grade de opções não localizada")
 
+    # normaliza colunas
     rename_map = {}
     for c in chain.columns:
         cl = str(c).strip().lower()
@@ -66,6 +72,7 @@ def suggest(data: SuggestIn):
         elif "código" in cl or "ticker" in cl: rename_map[c] = "ticker_opcao"
     chain = chain.rename(columns=rename_map)
 
+    # tipos numéricos e filtro de liquidez
     for col in ["strike", "premio"]:
         chain[col] = pd.to_numeric(chain[col], errors="coerce")
     chain["negocios"] = pd.to_numeric(chain.get("negocios", 0), errors="coerce").fillna(0).astype(int)
@@ -74,6 +81,7 @@ def suggest(data: SuggestIn):
     if chain.empty:
         raise HTTPException(status_code=404, detail="Sem liquidez suficiente")
 
+    # janelas de tempo e retornos
     hoje = datetime.now()
     venc = datetime.strptime(venc_str, "%Y-%m-%d")
     dias = max((venc - hoje).days, 1)
@@ -81,6 +89,7 @@ def suggest(data: SuggestIn):
     chain["retorno_premio_pct"] = chain["premio"] / pm * 100.0
     chain["retorno_anualizado_pct"] = chain["retorno_premio_pct"] * (252 / dias)
 
+    # critério de strike
     if criterio == ">=PM":
         chain = chain[chain["strike"] >= pm]
     elif criterio == "PM":
@@ -95,6 +104,7 @@ def suggest(data: SuggestIn):
     premio = float(melhor["premio"])
     contratos = qty // 100
 
+    # cenários
     def resultado(preco_venc):
         if preco_venc >= strike:
             venda = strike * qty
@@ -126,3 +136,4 @@ def suggest(data: SuggestIn):
         "cenarios": cenarios,
         "fonte_dados": "opcoes.net (scraping ~delay)"
     }
+
