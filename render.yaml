@@ -3,14 +3,14 @@ services:
     name: robo-venda-coberta
     env: docker
     plan: free
-    dockerfilePath: Dockerfile
     repo: https://github.com/emilymmm21/robo-venda-coberta
     branch: main
     healthCheckPath: /health
     envVars:
       - key: PORT
         value: 10000
-
+      - key: SCRAPER_PROVIDER
+        value: playwright
 
 
 

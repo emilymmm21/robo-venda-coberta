@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -e
-exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}
+set -euo pipefail
+
+# Uvicorn com o módulo main:app (renomeado)
+exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-10000}"
 
 
