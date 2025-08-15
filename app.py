@@ -120,3 +120,19 @@ def suggest(data: SuggestIn):
         "cenarios": cenarios,
         "fonte_dados": "opcoes.net (scraping ~delay)"
     }
+from fastapi import FastAPI, Response
+
+app = FastAPI(title="robo-venda-coberta")
+
+@app.get("/")
+def root():
+    return {"status": "ok", "docs": "/docs"}
+
+@app.head("/")
+def head_root():
+    # evita 404 em HEAD /
+    return Response(status_code=200)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
