@@ -8,6 +8,4 @@ orjson==3.11.2
 ujson==5.10.0
 python-dotenv==1.1.1
 python-multipart==0.0.20
-
-# Renderização JS para capturar a grade
 playwright==1.45.0
