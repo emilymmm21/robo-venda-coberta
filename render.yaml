@@ -2,7 +2,8 @@ services:
   - type: web
     name: robo-venda-coberta
     env: docker
-    dockerfilePath: ./Dockerfile
+    dockerfilePath: ./dockerfile
+
 
 
 
