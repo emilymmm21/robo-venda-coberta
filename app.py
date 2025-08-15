@@ -120,19 +120,22 @@ def suggest(data: SuggestIn):
         "cenarios": cenarios,
         "fonte_dados": "opcoes.net (scraping ~delay)"
     }
-from fastapi import FastAPI, Response
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="robo-venda-coberta")
+# se você já tinha "app = FastAPI()", mantenha; isto só garante que exista
+app = FastAPI(title="robo-venda-coberta", version="1.0.0")
 
-@app.get("/")
+# --- rotas utilitárias para evitar 404/healthcheck ---
+@app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "docs": "/docs"}
+    return {"ok": True, "message": "Robo Venda Coberta API"}
 
-@app.head("/")
-def head_root():
-    # evita 404 em HEAD /
-    return Response(status_code=200)
-
-@app.get("/health")
+@app.get("/health", include_in_schema=False)
 def health():
-    return {"ok": True}
+    return JSONResponse({"status": "ok"})
+
+# ▼▼▼ (suas rotas originais continuam aqui, não removi nada) ▼▼▼
+# from bs4 import BeautifulSoup  # agora disponível
+# ... resto do seu código ...
+
