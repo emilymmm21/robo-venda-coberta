@@ -1,19 +1,21 @@
 FROM python:3.13-slim
 
-WORKDIR /app
-
-# dependências nativas pro lxml e build
+# deps básicas (e libs que o Chromium pode precisar)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libxml2-dev libxslt-dev \
-  && rm -rf /var/lib/apt/lists/*
+    build-essential curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# Instala deps Python + Playwright + Chromium dentro da imagem
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -m playwright install --with-deps chromium
 
 COPY . .
 
-# porta que o Render detecta
 ENV PORT=10000
-EXPOSE 10000
+# opcional: desligar o headless fallback se precisar
+# ENV USE_PLAYWRIGHT=0
 
-CMD ["./start.sh"]
+CMD ["bash", "start.sh"]
