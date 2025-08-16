@@ -716,7 +716,88 @@ def mei_signal(inp: SignalIn):
             "Ajuste 'news_bias' para bullish/bearish se houver fato relevante."
         ]
     }
+# ====== News (env) ======
+USE_NEWS = os.getenv("USE_NEWS", "0") == "1"
+NEWS_BASE_URL = os.getenv("NEWS_BASE_URL", "")
+NEWS_QUERY_TEMPLATE = os.getenv("NEWS_QUERY_TEMPLATE", "q={query}&language=pt&sortBy=publishedAt&pageSize=30")
+NEWS_AUTH_HEADER = os.getenv("NEWS_AUTH_HEADER", "Authorization")
+NEWS_BEARER = os.getenv("NEWS_BEARER", "0") == "1"
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
+def news_headers() -> Dict[str, str]:
+    if not NEWS_API_KEY:
+        return {}
+    token = f"Bearer {NEWS_API_KEY}" if NEWS_BEARER else NEWS_API_KEY
+    return {NEWS_AUTH_HEADER: token}
+
+def build_news_url(query: str) -> str:
+    q = NEWS_QUERY_TEMPLATE.format(query=query)
+    return f"{NEWS_BASE_URL.rstrip('/')}?{q}"
+
+BULL_WORDS = {"alta","sobe","subiu","otimista","positivo","forte","recorde","aprova","aprovação","ganho"}
+BEAR_WORDS = {"queda","cai","caiu","pessimista","negativo","fraco","despenca","reprova","risco","perde"}
+
+def simple_sentiment(text: str) -> int:
+    t = (text or "").lower()
+    score = 0
+    score += sum(w in t for w in BULL_WORDS)
+    score -= sum(w in t for w in BEAR_WORDS)
+    return score
+
+def fetch_news_bias_for_ticker(ticker: str, extra_terms: Optional[List[str]] = None, lookback_days: int = 3) -> Optional[str]:
+    if not USE_NEWS or not NEWS_BASE_URL:
+        return None
+    q_terms = [ticker, "ações"]
+    if extra_terms:
+        q_terms += extra_terms
+    query = " ".join(q_terms)
+    url = build_news_url(query)
+    try:
+        r = requests.get(url, headers=news_headers(), timeout=15)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        j = r.json()
+    except Exception:
+        return None
+    # NewsAPI: artigos em j["articles"]; tente também j["data"] se outro provedor
+    arts = j.get("articles") or j.get("data") or []
+    if not isinstance(arts, list):
+        return None
+
+    since = datetime.utcnow() - timedelta(days=lookback_days)
+    score = 0
+    n = 0
+    for a in arts:
+        title = a.get("title") or ""
+        desc  = a.get("description") or a.get("summary") or ""
+        published = a.get("publishedAt") or a.get("published_at") or ""
+        try:
+            when = datetime.fromisoformat(published.replace("Z",""))
+        except Exception:
+            when = None
+        if when and when < since:
+            continue
+        score += simple_sentiment(title) + simple_sentiment(desc)
+        n += 1
+
+    if n == 0:
+        return None
+    if score >= 2:
+        return "bullish"
+    if score <= -2:
+        return "bearish"
+    return "neutral"
+class NewsIn(BaseModel):
+    ticker: str
+    lookback_days: int = 3
+
+@app.post("/mei/news-bias")
+def mei_news_bias(inp: NewsIn):
+    bias = fetch_news_bias_for_ticker(inp.ticker.upper(), lookback_days=inp.lookback_days)
+    return {"ticker": inp.ticker.upper(), "bias": bias}
 # ==============================
 # Fim
 # ==============================
